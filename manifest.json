@@ -1,0 +1,10 @@
+{
+  "id": "obsync",
+  "name": "ObSync",
+  "version": "1.0.0",
+  "minAppVersion": "1.4.0",
+  "description": "Securely synchronize your Obsidian vault with Google Drive across desktop and mobile.",
+  "author": "Your Name",
+  "authorUrl": "",
+  "isDesktopOnly": false
+}
