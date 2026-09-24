@@ -1,0 +1,25 @@
+{
+  "name": "obsync",
+  "version": "1.0.0",
+  "description": "A secure, automatic, and manual Google Drive sync plugin for Obsidian.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs production"
+  },
+  "keywords": [
+    "obsidian",
+    "plugin",
+    "sync",
+    "google-drive"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^18.11.9",
+    "builtin-modules": "^5.4.0",
+    "esbuild": "^0.17.3",
+    "obsidian": "latest",
+    "typescript": "5.2.2"
+  }
+}
