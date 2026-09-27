@@ -515,6 +515,9 @@ ${logContent}`);
       for (const [path, lFile] of localFileMap.entries()) {
         const dFile = driveFileMap.get(path);
         const lTime = lFile.stat.mtime;
+        const stateFileTime = state.files[path];
+        const stateTimeMs = stateFileTime ? new Date(stateFileTime).getTime() : 0;
+        const localChanged = stateTimeMs ? Math.abs(lTime - stateTimeMs) > 2e3 : true;
         if (!dFile) {
           if (state.files[path])
             this.progress.totalDeletions++;
@@ -522,9 +525,10 @@ ${logContent}`);
             this.progress.totalUploads++;
         } else {
           const dTime = new Date(dFile.modifiedTime).getTime();
-          if (lTime > dTime + 2e3)
-            this.progress.totalUploads++;
-          else if (dTime > lTime + 2e3)
+          if (lTime > dTime + 2e3) {
+            if (localChanged)
+              this.progress.totalUploads++;
+          } else if (dTime > lTime + 2e3)
             this.progress.totalDownloads++;
         }
       }
@@ -565,15 +569,21 @@ ${logContent}`);
           const dModTime = dFile.modifiedTime;
           const lTime = lFile.stat.mtime;
           const dTime = new Date(dModTime).getTime();
+          const stateTimeMs = stateFileTime ? new Date(stateFileTime).getTime() : 0;
+          const localChanged = stateTimeMs ? Math.abs(lTime - stateTimeMs) > 2e3 : true;
           if (lTime > dTime + 2e3) {
-            this.progress.currentFile = path;
-            this.updateProgressUI();
-            const targetFolderId = await this.plugin.driveApi.getOrCreateFolderTree(dirName, rootFolderId);
-            const content = await this.plugin.app.vault.adapter.readBinary(path);
-            await this.plugin.driveApi.uploadFile(targetFolderId, fileName, path, rootFolderId, content, dFile.id, lModTime);
-            newState.files[path] = lModTime;
-            uploadedFiles.push(path);
-            this.progress.completedUploads++;
+            if (localChanged) {
+              this.progress.currentFile = path;
+              this.updateProgressUI();
+              const targetFolderId = await this.plugin.driveApi.getOrCreateFolderTree(dirName, rootFolderId);
+              const content = await this.plugin.app.vault.adapter.readBinary(path);
+              await this.plugin.driveApi.uploadFile(targetFolderId, fileName, path, rootFolderId, content, dFile.id, lModTime);
+              newState.files[path] = lModTime;
+              uploadedFiles.push(path);
+              this.progress.completedUploads++;
+            } else {
+              newState.files[path] = stateFileTime;
+            }
           } else if (dTime > lTime + 2e3) {
             this.progress.currentFile = path;
             this.updateProgressUI();

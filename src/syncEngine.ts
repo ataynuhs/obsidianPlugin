@@ -212,12 +212,18 @@ export class SyncEngine {
 			for (const [path, lFile] of localFileMap.entries()) {
 				const dFile = driveFileMap.get(path);
 				const lTime = lFile.stat.mtime;
+				const stateFileTime = state.files[path];
+				const stateTimeMs = stateFileTime ? new Date(stateFileTime).getTime() : 0;
+				const localChanged = stateTimeMs ? Math.abs(lTime - stateTimeMs) > 2000 : true;
+
 				if (!dFile) {
 					if (state.files[path]) this.progress.totalDeletions++;
 					else this.progress.totalUploads++;
 				} else {
 					const dTime = new Date(dFile.modifiedTime).getTime();
-					if (lTime > dTime + 2000) this.progress.totalUploads++;
+					if (lTime > dTime + 2000) {
+						if (localChanged) this.progress.totalUploads++;
+					}
 					else if (dTime > lTime + 2000) this.progress.totalDownloads++;
 				}
 			}
@@ -265,15 +271,23 @@ export class SyncEngine {
 					const lTime = lFile.stat.mtime;
 					const dTime = new Date(dModTime).getTime();
 
+					const stateTimeMs = stateFileTime ? new Date(stateFileTime).getTime() : 0;
+					const localChanged = stateTimeMs ? Math.abs(lTime - stateTimeMs) > 2000 : true;
+
 					if (lTime > dTime + 2000) {
-						// Local is newer
-						this.progress.currentFile = path; this.updateProgressUI();
-						const targetFolderId = await this.plugin.driveApi.getOrCreateFolderTree(dirName, rootFolderId);
-						const content = await this.plugin.app.vault.adapter.readBinary(path);
-						await this.plugin.driveApi.uploadFile(targetFolderId, fileName, path, rootFolderId, content, dFile.id, lModTime);
-						newState.files[path] = lModTime;
-						uploadedFiles.push(path);
-						this.progress.completedUploads++;
+						// Local mtime is newer than remote mtime
+						if (localChanged) {
+							this.progress.currentFile = path; this.updateProgressUI();
+							const targetFolderId = await this.plugin.driveApi.getOrCreateFolderTree(dirName, rootFolderId);
+							const content = await this.plugin.app.vault.adapter.readBinary(path);
+							await this.plugin.driveApi.uploadFile(targetFolderId, fileName, path, rootFolderId, content, dFile.id, lModTime);
+							newState.files[path] = lModTime;
+							uploadedFiles.push(path);
+							this.progress.completedUploads++;
+						} else {
+							// In sync (local downloaded it previously, so lTime > dTime, but it hasn't actually been edited)
+							newState.files[path] = stateFileTime;
+						}
 					} else if (dTime > lTime + 2000) {
 						// Remote is newer
 						this.progress.currentFile = path; this.updateProgressUI();
