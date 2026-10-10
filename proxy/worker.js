@@ -66,10 +66,24 @@ export default {
       
       return new Response(
         `<html>
+           <head>
+             <meta name="viewport" content="width=device-width, initial-scale=1">
+             <style>
+               body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #f9f9f9; text-align: center; padding: 20px; }
+               .btn { display: inline-block; padding: 15px 30px; font-size: 18px; color: white; background-color: #7b61ff; text-decoration: none; border-radius: 8px; font-weight: bold; margin-top: 20px; border: none; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+               p { color: #555; }
+             </style>
+           </head>
            <body>
-             <p>Authentication successful! Redirecting back to Obsidian...</p>
-             <p>If you are not redirected automatically, <a href="${obsidianRedirect}">click here</a>.</p>
-             <script>window.location.href = "${obsidianRedirect}";</script>
+             <h2>Authentication Successful!</h2>
+             <p>Redirecting you back to Obsidian...</p>
+             <p>If nothing happens (Firefox users), please tap the button below:</p>
+             <a href="${obsidianRedirect}" class="btn">Open Obsidian</a>
+             <script>
+               setTimeout(() => {
+                 window.location.href = "${obsidianRedirect}";
+               }, 500);
+             </script>
            </body>
          </html>`, 
          { headers: { "Content-Type": "text/html" } }
