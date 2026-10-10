@@ -617,8 +617,12 @@ ${logContent}`);
         return;
       }
       this.pendingPlan = plan;
-      this.progress.status = "Confirming";
-      this.updateProgressUI();
+      if (plan.conflicts.length === 0) {
+        this.executeSync();
+      } else {
+        this.progress.status = "Confirming";
+        this.updateProgressUI();
+      }
     } catch (error) {
       console.error("Sync error:", error);
       this.progress.status = "Error";
