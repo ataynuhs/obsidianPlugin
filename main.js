@@ -104,7 +104,8 @@ var GoogleAuth = class {
       new import_obsidian2.Notice("Please provide a Proxy URL in settings first.");
       return;
     }
-    const loginUrl = `${this.plugin.settings.proxyUrl}/login`;
+    const vaultName = encodeURIComponent(this.plugin.app.vault.getName());
+    const loginUrl = `${this.plugin.settings.proxyUrl}/login?vault=${vaultName}`;
     window.open(loginUrl);
     new import_obsidian2.Notice("Opened browser for Google Auth. Waiting for response...");
   }

@@ -10,9 +10,12 @@ export default {
 
     // Endpoint 1: Initiate Login
     if (url.pathname === "/login") {
+      const vault = url.searchParams.get("vault") || "";
       const redirectUri = `${url.origin}/callback`;
       const scope = encodeURIComponent("https://www.googleapis.com/auth/drive.file");
-      const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${env.GOOGLE_CLIENT_ID}&redirect_uri=${redirectUri}&response_type=code&scope=${scope}&access_type=offline&prompt=consent`;
+      
+      const state = encodeURIComponent(vault);
+      const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${env.GOOGLE_CLIENT_ID}&redirect_uri=${redirectUri}&response_type=code&scope=${scope}&access_type=offline&prompt=consent&state=${state}`;
       
       return Response.redirect(authUrl, 302);
     }
@@ -21,6 +24,7 @@ export default {
     if (url.pathname === "/callback") {
       const code = url.searchParams.get("code");
       const error = url.searchParams.get("error");
+      const state = url.searchParams.get("state") || "";
 
       if (error) {
         return new Response(`Authentication Error: ${error}`, { status: 400 });
@@ -55,7 +59,10 @@ export default {
       
       // Redirect back to Obsidian using custom URI scheme
       // Note: The plugin must register 'obsidian://obsync-auth'
-      const obsidianRedirect = `obsidian://obsync-auth?refresh_token=${encodeURIComponent(data.refresh_token)}&access_token=${encodeURIComponent(data.access_token)}&expires_in=${data.expires_in}`;
+      let obsidianRedirect = `obsidian://obsync-auth?refresh_token=${encodeURIComponent(data.refresh_token)}&access_token=${encodeURIComponent(data.access_token)}&expires_in=${data.expires_in}`;
+      if (state) {
+        obsidianRedirect += `&vault=${encodeURIComponent(state)}`;
+      }
       
       return new Response(
         `<html>

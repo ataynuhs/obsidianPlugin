@@ -16,7 +16,8 @@ export class GoogleAuth {
 			return;
 		}
 
-		const loginUrl = `${this.plugin.settings.proxyUrl}/login`;
+		const vaultName = encodeURIComponent(this.plugin.app.vault.getName());
+		const loginUrl = `${this.plugin.settings.proxyUrl}/login?vault=${vaultName}`;
 		window.open(loginUrl);
 		new Notice('Opened browser for Google Auth. Waiting for response...');
 	}
