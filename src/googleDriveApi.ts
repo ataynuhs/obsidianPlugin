@@ -43,19 +43,30 @@ export class GoogleDriveApi {
 		let attempt = 0;
 		while (attempt <= retries) {
 			attempt++;
-			const response = await requestUrl({
-				url,
-				method,
-				headers,
-				body: requestBody,
-				throw: false // Crucial: don't auto-throw so we can parse the real error!
-			});
+			let response;
+			try {
+				response = await requestUrl({
+					url,
+					method,
+					headers,
+					body: requestBody,
+					throw: false
+				});
+			} catch (networkError) {
+				if (attempt <= retries) {
+					const backoffTime = attempt * 2000;
+					console.log(`Drive API Network Error (${networkError.message}). Retrying in ${backoffTime}ms...`);
+					await new Promise(resolve => window.setTimeout(resolve, backoffTime));
+					continue;
+				}
+				throw new Error(`Network Error: ${networkError.message}`);
+			}
 
 			if (response.status >= 200 && response.status < 300) {
 				if (returnType === 'arraybuffer') {
 					return response.arrayBuffer;
 				}
-				return response.json;
+				return response.text ? response.json : null;
 			}
 
 			// If it's a rate limit error (403 or 429) and we have retries left, back off
@@ -82,7 +93,8 @@ export class GoogleDriveApi {
 	}
 
 	async getFolderId(folderName: string, parentId?: string): Promise<string | null> {
-		let q = `mimeType='application/vnd.google-apps.folder' and name='${folderName}' and trashed=false`;
+		const escapedName = folderName.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+		let q = `mimeType='application/vnd.google-apps.folder' and name='${escapedName}' and trashed=false`;
 		if (parentId) {
 			q += ` and '${parentId}' in parents`;
 		} else {
@@ -201,13 +213,18 @@ export class GoogleDriveApi {
 
 		const metadataPart = `Content-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}`;
 		
-		let base64Data = '';
-		const bytes = new Uint8Array(content);
-		const chunk = 8192;
-		for (let i = 0; i < bytes.length; i += chunk) {
-			base64Data += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunk)));
+		let base64Content = '';
+		if (typeof Buffer !== 'undefined') {
+			base64Content = Buffer.from(content).toString('base64');
+		} else {
+			let base64Data = '';
+			const bytes = new Uint8Array(content);
+			const chunk = 8192;
+			for (let i = 0; i < bytes.length; i += chunk) {
+				base64Data += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunk)));
+			}
+			base64Content = btoa(base64Data);
 		}
-		const base64Content = btoa(base64Data);
 
 		const mediaPart = `Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\n${base64Content}`;
 		const multipartRequestBody = `${delimiter}${metadataPart}${delimiter}${mediaPart}${close_delim}`;

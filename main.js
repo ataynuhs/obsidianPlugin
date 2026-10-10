@@ -181,19 +181,29 @@ var GoogleDriveApi = class {
     let attempt = 0;
     while (attempt <= retries) {
       attempt++;
-      const response = await (0, import_obsidian3.requestUrl)({
-        url,
-        method,
-        headers,
-        body: requestBody,
-        throw: false
-        // Crucial: don't auto-throw so we can parse the real error!
-      });
+      let response;
+      try {
+        response = await (0, import_obsidian3.requestUrl)({
+          url,
+          method,
+          headers,
+          body: requestBody,
+          throw: false
+        });
+      } catch (networkError) {
+        if (attempt <= retries) {
+          const backoffTime = attempt * 2e3;
+          console.log(`Drive API Network Error (${networkError.message}). Retrying in ${backoffTime}ms...`);
+          await new Promise((resolve) => window.setTimeout(resolve, backoffTime));
+          continue;
+        }
+        throw new Error(`Network Error: ${networkError.message}`);
+      }
       if (response.status >= 200 && response.status < 300) {
         if (returnType === "arraybuffer") {
           return response.arrayBuffer;
         }
-        return response.json;
+        return response.text ? response.json : null;
       }
       if ((response.status === 403 || response.status === 429 || response.status >= 500) && attempt <= retries) {
         const backoffTime = attempt * 2e3;
@@ -213,7 +223,8 @@ var GoogleDriveApi = class {
     }
   }
   async getFolderId(folderName, parentId) {
-    let q = `mimeType='application/vnd.google-apps.folder' and name='${folderName}' and trashed=false`;
+    const escapedName = folderName.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    let q = `mimeType='application/vnd.google-apps.folder' and name='${escapedName}' and trashed=false`;
     if (parentId) {
       q += ` and '${parentId}' in parents`;
     } else {
@@ -315,13 +326,18 @@ var GoogleDriveApi = class {
     const metadataPart = `Content-Type: application/json; charset=UTF-8\r
 \r
 ${JSON.stringify(metadata)}`;
-    let base64Data = "";
-    const bytes = new Uint8Array(content);
-    const chunk = 8192;
-    for (let i = 0; i < bytes.length; i += chunk) {
-      base64Data += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunk)));
+    let base64Content = "";
+    if (typeof Buffer !== "undefined") {
+      base64Content = Buffer.from(content).toString("base64");
+    } else {
+      let base64Data = "";
+      const bytes = new Uint8Array(content);
+      const chunk = 8192;
+      for (let i = 0; i < bytes.length; i += chunk) {
+        base64Data += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunk)));
+      }
+      base64Content = btoa(base64Data);
     }
-    const base64Content = btoa(base64Data);
     const mediaPart = `Content-Type: application/octet-stream\r
 Content-Transfer-Encoding: base64\r
 \r
@@ -364,6 +380,7 @@ var SyncEngine = class {
       completedDeletions: 0,
       currentFile: ""
     };
+    this.pendingPlan = null;
     this.plugin = plugin;
   }
   updateProgressUI() {
@@ -372,6 +389,8 @@ var SyncEngine = class {
         this.statusBarItem.setText("ObSync: Up to date");
       } else if (this.progress.status === "Scanning") {
         this.statusBarItem.setText("ObSync: Scanning...");
+      } else if (this.progress.status === "Confirming") {
+        this.statusBarItem.setText("ObSync: Awaiting Confirmation");
       } else if (this.progress.status === "Syncing") {
         this.statusBarItem.setText(`ObSync: Up ${this.progress.completedUploads}/${this.progress.totalUploads} | Down ${this.progress.completedDownloads}/${this.progress.totalDownloads}`);
       } else if (this.progress.status === "Error") {
@@ -404,13 +423,15 @@ var SyncEngine = class {
       console.error("Failed to save sync state", e);
     }
   }
-  async writeLog(uploads, downloads, deletions) {
+  async writeLog(uploads, downloads, deletions, conflicts) {
     let logContent = `
 ## Sync: ${(/* @__PURE__ */ new Date()).toLocaleString()}
 `;
-    if (uploads.length === 0 && downloads.length === 0 && deletions.length === 0) {
+    if (uploads.length === 0 && downloads.length === 0 && deletions.length === 0 && conflicts.length === 0) {
       logContent += "- *No changes detected.*\n";
     } else {
+      conflicts.forEach((f) => logContent += `- **CONFLICT RESOLVED:** \`${f}\`
+`);
       uploads.forEach((f) => logContent += `- **Uploaded:** \`${f}\`
 `);
       downloads.forEach((f) => logContent += `- **Downloaded:** \`${f}\`
@@ -482,7 +503,7 @@ ${logContent}`);
       return;
     }
     this.syncLock = true;
-    new import_obsidian4.Notice("Syncing with Google Drive...");
+    this.pendingPlan = null;
     this.progress = {
       status: "Scanning",
       totalUploads: 0,
@@ -494,16 +515,12 @@ ${logContent}`);
       currentFile: ""
     };
     this.updateProgressUI();
-    const uploadedFiles = [];
-    const downloadedFiles = [];
-    const deletedFiles = [];
     try {
       const folderName = this.plugin.settings.syncFolder;
       const rootFolderId = await this.plugin.driveApi.ensureRootFolder(folderName);
       const driveFiles = await this.plugin.driveApi.listAllVaultFiles(rootFolderId);
       const localFiles = await this.getLocalFiles();
       const state = await this.loadState();
-      const newState = { lastSync: Date.now(), files: {} };
       const driveFileMap = /* @__PURE__ */ new Map();
       for (const df of driveFiles) {
         driveFileMap.set(df.vaultPath, df);
@@ -512,130 +529,222 @@ ${logContent}`);
       for (const lf of localFiles) {
         localFileMap.set(lf.path, lf);
       }
+      const plan = {
+        uploads: [],
+        downloads: [],
+        deletionsLocal: [],
+        deletionsRemote: [],
+        conflicts: [],
+        driveFiles: driveFileMap,
+        localFiles: localFileMap,
+        state,
+        rootFolderId
+      };
       for (const [path, lFile] of localFileMap.entries()) {
         const dFile = driveFileMap.get(path);
         const lTime = lFile.stat.mtime;
-        const stateFileTime = state.files[path];
-        const stateTimeMs = stateFileTime ? new Date(stateFileTime).getTime() : 0;
-        const localChanged = stateTimeMs ? Math.abs(lTime - stateTimeMs) > 2e3 : true;
-        if (!dFile) {
-          if (state.files[path])
-            this.progress.totalDeletions++;
-          else
-            this.progress.totalUploads++;
-        } else {
-          const dTime = new Date(dFile.modifiedTime).getTime();
-          if (lTime > dTime + 2e3) {
-            if (localChanged)
-              this.progress.totalUploads++;
-          } else if (dTime > lTime + 2e3)
-            this.progress.totalDownloads++;
+        const stateFile = state.files[path];
+        let localChanged = true;
+        if (stateFile) {
+          const stateLocalTime = typeof stateFile === "string" ? new Date(stateFile).getTime() : stateFile.local;
+          localChanged = Math.abs(lTime - stateLocalTime) > 2e3;
         }
-      }
-      for (const path of driveFileMap.keys()) {
-        if (!localFileMap.has(path)) {
-          if (state.files[path])
-            this.progress.totalDeletions++;
-          else
-            this.progress.totalDownloads++;
-        }
-      }
-      this.progress.status = "Syncing";
-      this.updateProgressUI();
-      for (const [path, lFile] of localFileMap.entries()) {
-        const dFile = driveFileMap.get(path);
-        const lModTime = new Date(lFile.stat.mtime).toISOString();
-        const stateFileTime = state.files[path];
-        const dirName = path.includes("/") ? path.substring(0, path.lastIndexOf("/")) : "";
-        const fileName = lFile.name;
         if (!dFile) {
-          if (stateFileTime) {
-            this.progress.currentFile = path;
-            this.updateProgressUI();
-            await this.plugin.app.vault.adapter.remove(path);
-            deletedFiles.push(path);
-            this.progress.completedDeletions++;
+          if (stateFile && !localChanged) {
+            plan.deletionsLocal.push(path);
           } else {
-            this.progress.currentFile = path;
-            this.updateProgressUI();
-            const targetFolderId = await this.plugin.driveApi.getOrCreateFolderTree(dirName, rootFolderId);
-            const content = await this.plugin.app.vault.adapter.readBinary(path);
-            await this.plugin.driveApi.uploadFile(targetFolderId, fileName, path, rootFolderId, content, void 0, lModTime);
-            newState.files[path] = lModTime;
-            uploadedFiles.push(path);
-            this.progress.completedUploads++;
+            plan.uploads.push(path);
           }
         } else {
-          const dModTime = dFile.modifiedTime;
-          const lTime = lFile.stat.mtime;
-          const dTime = new Date(dModTime).getTime();
-          const stateTimeMs = stateFileTime ? new Date(stateFileTime).getTime() : 0;
-          const localChanged = stateTimeMs ? Math.abs(lTime - stateTimeMs) > 2e3 : true;
-          if (lTime > dTime + 2e3) {
-            if (localChanged) {
-              this.progress.currentFile = path;
-              this.updateProgressUI();
-              const targetFolderId = await this.plugin.driveApi.getOrCreateFolderTree(dirName, rootFolderId);
-              const content = await this.plugin.app.vault.adapter.readBinary(path);
-              await this.plugin.driveApi.uploadFile(targetFolderId, fileName, path, rootFolderId, content, dFile.id, lModTime);
-              newState.files[path] = lModTime;
-              uploadedFiles.push(path);
-              this.progress.completedUploads++;
+          const dTime = new Date(dFile.modifiedTime).getTime();
+          let remoteChanged = true;
+          if (stateFile) {
+            if (typeof stateFile === "string") {
+              remoteChanged = dTime > lTime + 2e3;
             } else {
-              newState.files[path] = stateFileTime;
+              const stateDriveTime = new Date(stateFile.drive).getTime();
+              remoteChanged = Math.abs(dTime - stateDriveTime) > 2e3;
             }
-          } else if (dTime > lTime + 2e3) {
-            this.progress.currentFile = path;
-            this.updateProgressUI();
-            const content = await this.plugin.driveApi.downloadFile(dFile.id);
-            await this.plugin.app.vault.adapter.writeBinary(path, content);
-            newState.files[path] = new Date((await this.plugin.app.vault.adapter.stat(path)).mtime).toISOString();
-            downloadedFiles.push(path);
-            this.progress.completedDownloads++;
-          } else {
-            newState.files[path] = lModTime;
+          }
+          const isConflict = stateFile && localChanged && remoteChanged;
+          if (!stateFile) {
+            if (lTime > dTime + 2e3) {
+              plan.uploads.push(path);
+            } else if (dTime > lTime + 2e3) {
+              plan.downloads.push(path);
+            }
+          } else if (isConflict) {
+            plan.conflicts.push(path);
+          } else if (localChanged) {
+            plan.uploads.push(path);
+          } else if (remoteChanged) {
+            plan.downloads.push(path);
           }
         }
       }
       for (const [path, dFile] of driveFileMap.entries()) {
         if (!localFileMap.has(path)) {
-          const stateFileTime = state.files[path];
-          if (stateFileTime) {
-            this.progress.currentFile = path;
-            this.updateProgressUI();
-            await this.plugin.driveApi.deleteFile(dFile.id);
-            deletedFiles.push(path);
-            this.progress.completedDeletions++;
-          } else {
-            this.progress.currentFile = path;
-            this.updateProgressUI();
-            const content = await this.plugin.driveApi.downloadFile(dFile.id);
-            const parts = path.split("/");
-            parts.pop();
-            let currentPath = "";
-            for (const part of parts) {
-              currentPath += (currentPath === "" ? "" : "/") + part;
-              if (!await this.plugin.app.vault.adapter.exists(currentPath)) {
-                await this.plugin.app.vault.adapter.mkdir(currentPath);
-              }
+          const stateFile = state.files[path];
+          const dTime = new Date(dFile.modifiedTime).getTime();
+          let remoteChanged = true;
+          if (stateFile) {
+            if (typeof stateFile === "string") {
+              remoteChanged = false;
+            } else {
+              const stateDriveTime = new Date(stateFile.drive).getTime();
+              remoteChanged = Math.abs(dTime - stateDriveTime) > 2e3;
             }
-            await this.plugin.app.vault.adapter.writeBinary(path, content);
-            newState.files[path] = new Date((await this.plugin.app.vault.adapter.stat(path)).mtime).toISOString();
-            downloadedFiles.push(path);
-            this.progress.completedDownloads++;
+          }
+          if (stateFile && !remoteChanged) {
+            plan.deletionsRemote.push(path);
+          } else {
+            if (!plan.downloads.includes(path) && !plan.conflicts.includes(path)) {
+              plan.downloads.push(path);
+            }
           }
         }
       }
+      this.progress.totalUploads = plan.uploads.length + plan.conflicts.length;
+      this.progress.totalDownloads = plan.downloads.length + plan.conflicts.length;
+      this.progress.totalDeletions = plan.deletionsLocal.length + plan.deletionsRemote.length;
+      if (this.progress.totalUploads === 0 && this.progress.totalDownloads === 0 && this.progress.totalDeletions === 0) {
+        this.progress.status = "Idle";
+        this.updateProgressUI();
+        new import_obsidian4.Notice("Sync Complete! No changes detected.");
+        this.syncLock = false;
+        return;
+      }
+      this.pendingPlan = plan;
+      this.progress.status = "Confirming";
+      this.updateProgressUI();
+    } catch (error) {
+      console.error("Sync error:", error);
+      this.progress.status = "Error";
+      this.progress.errorMessage = error.message;
+      this.updateProgressUI();
+      new import_obsidian4.Notice(`Sync failed: ${error.message}`);
+      this.syncLock = false;
+    }
+  }
+  cancelSync() {
+    this.pendingPlan = null;
+    this.syncLock = false;
+    this.progress.status = "Idle";
+    this.updateProgressUI();
+    new import_obsidian4.Notice("Sync Cancelled.");
+  }
+  async executeSync() {
+    if (!this.pendingPlan)
+      return;
+    const plan = this.pendingPlan;
+    this.pendingPlan = null;
+    this.progress.status = "Syncing";
+    this.updateProgressUI();
+    const uploadedFiles = [];
+    const downloadedFiles = [];
+    const deletedFiles = [];
+    const conflictFiles = [];
+    const newState = { lastSync: Date.now(), files: {} };
+    try {
+      for (const path of Object.keys(plan.state.files)) {
+        newState.files[path] = plan.state.files[path];
+      }
+      for (const path of plan.deletionsLocal) {
+        this.progress.currentFile = path;
+        this.updateProgressUI();
+        if (await this.plugin.app.vault.adapter.exists(path)) {
+          await this.plugin.app.vault.adapter.remove(path);
+        }
+        delete newState.files[path];
+        deletedFiles.push(path);
+        this.progress.completedDeletions++;
+      }
+      for (const path of plan.conflicts) {
+        this.progress.currentFile = `[CONFLICT] ${path}`;
+        this.updateProgressUI();
+        const lFile = plan.localFiles.get(path);
+        const dFile = plan.driveFiles.get(path);
+        const extMatch = path.match(/(\.[^.]+)$/);
+        const ext = extMatch ? extMatch[1] : "";
+        const conflictPath = path.replace(/(\.[^.]+)$/, "") + " (Conflict)" + ext;
+        const remoteContent = await this.plugin.driveApi.downloadFile(dFile.id);
+        await this.plugin.app.vault.adapter.writeBinary(conflictPath, remoteContent);
+        this.progress.completedDownloads++;
+        const lModTime = new Date(lFile.stat.mtime).toISOString();
+        const dirName = path.includes("/") ? path.substring(0, path.lastIndexOf("/")) : "";
+        const targetFolderId = await this.plugin.driveApi.getOrCreateFolderTree(dirName, plan.rootFolderId);
+        const localContent = await this.plugin.app.vault.adapter.readBinary(path);
+        const dFileRes = await this.plugin.driveApi.uploadFile(targetFolderId, lFile.name, path, plan.rootFolderId, localContent, dFile.id, lModTime);
+        newState.files[path] = { local: lFile.stat.mtime, drive: dFileRes.modifiedTime };
+        conflictFiles.push(path);
+        this.progress.completedUploads++;
+      }
+      for (const path of plan.uploads) {
+        this.progress.currentFile = path;
+        this.updateProgressUI();
+        const lFile = plan.localFiles.get(path);
+        const dFile = plan.driveFiles.get(path);
+        const lModTime = new Date(lFile.stat.mtime).toISOString();
+        const dirName = path.includes("/") ? path.substring(0, path.lastIndexOf("/")) : "";
+        const targetFolderId = await this.plugin.driveApi.getOrCreateFolderTree(dirName, plan.rootFolderId);
+        const content = await this.plugin.app.vault.adapter.readBinary(path);
+        const dFileRes = await this.plugin.driveApi.uploadFile(targetFolderId, lFile.name, path, plan.rootFolderId, content, dFile ? dFile.id : void 0, lModTime);
+        newState.files[path] = { local: lFile.stat.mtime, drive: dFileRes.modifiedTime };
+        uploadedFiles.push(path);
+        this.progress.completedUploads++;
+      }
+      for (const path of plan.deletionsRemote) {
+        this.progress.currentFile = path;
+        this.updateProgressUI();
+        const dFile = plan.driveFiles.get(path);
+        if (dFile) {
+          await this.plugin.driveApi.deleteFile(dFile.id);
+        }
+        delete newState.files[path];
+        deletedFiles.push(path);
+        this.progress.completedDeletions++;
+      }
+      for (const path of plan.downloads) {
+        this.progress.currentFile = path;
+        this.updateProgressUI();
+        const dFile = plan.driveFiles.get(path);
+        const content = await this.plugin.driveApi.downloadFile(dFile.id);
+        const parts = path.split("/");
+        parts.pop();
+        let currentPath = "";
+        for (const part of parts) {
+          currentPath += (currentPath === "" ? "" : "/") + part;
+          if (!await this.plugin.app.vault.adapter.exists(currentPath)) {
+            await this.plugin.app.vault.adapter.mkdir(currentPath);
+          }
+        }
+        await this.plugin.app.vault.adapter.writeBinary(path, content);
+        const newStat = await this.plugin.app.vault.adapter.stat(path);
+        newState.files[path] = { local: newStat.mtime, drive: dFile.modifiedTime };
+        downloadedFiles.push(path);
+        this.progress.completedDownloads++;
+      }
+      for (const path of plan.localFiles.keys()) {
+        if (!plan.uploads.includes(path) && !plan.deletionsLocal.includes(path) && !plan.downloads.includes(path) && !plan.conflicts.includes(path)) {
+          const lFile = plan.localFiles.get(path);
+          const oldState = plan.state.files[path];
+          const dFile = plan.driveFiles.get(path);
+          newState.files[path] = {
+            local: lFile.stat.mtime,
+            drive: dFile ? dFile.modifiedTime : typeof oldState === "string" ? oldState : oldState.drive
+          };
+        }
+      }
       await this.saveState(newState);
-      await this.writeLog(uploadedFiles, downloadedFiles, deletedFiles);
+      await this.writeLog(uploadedFiles, downloadedFiles, deletedFiles, conflictFiles);
       this.plugin.settings.lastSyncTime = Date.now();
       await this.plugin.saveSettings();
       this.progress.status = "Idle";
       this.progress.currentFile = "";
       this.updateProgressUI();
-      new import_obsidian4.Notice(`Sync Complete! Up: ${uploadedFiles.length}, Down: ${downloadedFiles.length}, Del: ${deletedFiles.length}`);
+      new import_obsidian4.Notice(`Sync Complete! Up: ${uploadedFiles.length}, Down: ${downloadedFiles.length}, Del: ${deletedFiles.length}, Conflicts: ${conflictFiles.length}`);
     } catch (error) {
-      console.error("Sync error:", error);
+      console.error("Sync execute error:", error);
       this.progress.status = "Error";
       this.progress.errorMessage = error.message;
       this.updateProgressUI();
@@ -671,6 +780,7 @@ var SyncStatusModal = class extends import_obsidian5.Modal {
       return;
     this.contentContainer.empty();
     const p = this.engine.progress;
+    const plan = this.engine.pendingPlan;
     const statusEl = this.contentContainer.createEl("h3", {
       text: `Status: ${p.status}`
     });
@@ -681,33 +791,139 @@ var SyncStatusModal = class extends import_obsidian5.Modal {
     if (p.status === "Scanning") {
       this.contentContainer.createEl("p", { text: "Scanning local vault and Google Drive metadata..." });
     }
+    if (p.status === "Confirming" && plan) {
+      this.contentContainer.createEl("p", { text: "Please review the planned changes before syncing:" });
+      const listChanges = (title, items, color, tooltip) => {
+        if (items.length > 0) {
+          const header = this.contentContainer.createEl("h4", { text: `${title} (${items.length})` });
+          header.style.color = color;
+          if (tooltip)
+            header.title = tooltip;
+          const ul = this.contentContainer.createEl("ul");
+          ul.style.maxHeight = "150px";
+          ul.style.overflowY = "auto";
+          items.forEach((item) => ul.createEl("li", { text: item }));
+        }
+      };
+      if (plan.conflicts.length > 0) {
+        const conflictWarning = this.contentContainer.createEl("p", {
+          text: "\u26A0\uFE0F CONFLICTS DETECTED: Files modified on both sides. Please choose a resolution:"
+        });
+        conflictWarning.style.color = "var(--text-error)";
+        conflictWarning.style.fontWeight = "bold";
+        const globalBulkDiv = this.contentContainer.createDiv();
+        globalBulkDiv.style.display = "flex";
+        globalBulkDiv.style.gap = "10px";
+        globalBulkDiv.style.marginBottom = "15px";
+        const globalLocalBtn = globalBulkDiv.createEl("button", { text: "Use Local for All" });
+        globalLocalBtn.onclick = () => {
+          plan.uploads.push(...plan.conflicts);
+          plan.conflicts = [];
+          this.renderData();
+        };
+        const globalDriveBtn = globalBulkDiv.createEl("button", { text: "Use Drive for All" });
+        globalDriveBtn.onclick = () => {
+          plan.downloads.push(...plan.conflicts);
+          plan.conflicts = [];
+          this.renderData();
+        };
+        const conflictsByFolder = /* @__PURE__ */ new Map();
+        plan.conflicts.forEach((item) => {
+          const dir = item.includes("/") ? item.substring(0, item.lastIndexOf("/")) : "Root";
+          if (!conflictsByFolder.has(dir))
+            conflictsByFolder.set(dir, []);
+          conflictsByFolder.get(dir).push(item);
+        });
+        const scrollContainer = this.contentContainer.createDiv();
+        scrollContainer.style.maxHeight = "250px";
+        scrollContainer.style.overflowY = "auto";
+        scrollContainer.style.border = "1px solid var(--background-modifier-border)";
+        scrollContainer.style.padding = "10px";
+        conflictsByFolder.forEach((files, dir) => {
+          const dirHeader = scrollContainer.createDiv();
+          dirHeader.style.display = "flex";
+          dirHeader.style.justifyContent = "space-between";
+          dirHeader.style.alignItems = "center";
+          dirHeader.style.marginTop = "10px";
+          dirHeader.style.borderBottom = "1px solid var(--background-modifier-border)";
+          dirHeader.createEl("strong", { text: `\u{1F4C2} ${dir}` });
+          const dirBulkDiv = dirHeader.createDiv();
+          dirBulkDiv.style.display = "flex";
+          dirBulkDiv.style.gap = "5px";
+          const dirLocalBtn = dirBulkDiv.createEl("button", { text: "Local (Folder)" });
+          dirLocalBtn.onclick = () => {
+            plan.uploads.push(...files);
+            plan.conflicts = plan.conflicts.filter((c) => !files.includes(c));
+            this.renderData();
+          };
+          const dirDriveBtn = dirBulkDiv.createEl("button", { text: "Drive (Folder)" });
+          dirDriveBtn.onclick = () => {
+            plan.downloads.push(...files);
+            plan.conflicts = plan.conflicts.filter((c) => !files.includes(c));
+            this.renderData();
+          };
+          const ul = scrollContainer.createEl("ul");
+          ul.style.marginBottom = "15px";
+          files.forEach((item) => {
+            const li = ul.createEl("li");
+            li.style.display = "flex";
+            li.style.justifyContent = "space-between";
+            li.style.alignItems = "center";
+            li.style.marginBottom = "8px";
+            li.createSpan({ text: item.includes("/") ? item.substring(item.lastIndexOf("/") + 1) : item });
+            const btnDiv = li.createDiv();
+            btnDiv.style.display = "flex";
+            btnDiv.style.gap = "5px";
+            const useLocalBtn = btnDiv.createEl("button", { text: "Local" });
+            useLocalBtn.onclick = () => {
+              plan.uploads.push(item);
+              plan.conflicts = plan.conflicts.filter((c) => c !== item);
+              this.renderData();
+            };
+            const useDriveBtn = btnDiv.createEl("button", { text: "Drive" });
+            useDriveBtn.onclick = () => {
+              plan.downloads.push(item);
+              plan.conflicts = plan.conflicts.filter((c) => c !== item);
+              this.renderData();
+            };
+          });
+        });
+      }
+      listChanges("Uploads", plan.uploads, "var(--text-success)");
+      listChanges("Downloads", plan.downloads, "var(--text-accent)");
+      listChanges("Local Deletions", plan.deletionsLocal, "var(--text-muted)");
+      listChanges("Remote Deletions", plan.deletionsRemote, "var(--text-muted)");
+      const buttonDiv = this.contentContainer.createDiv();
+      buttonDiv.style.marginTop = "20px";
+      buttonDiv.style.display = "flex";
+      buttonDiv.style.gap = "10px";
+      const confirmBtn = buttonDiv.createEl("button", { text: "Confirm Sync", cls: "mod-cta" });
+      confirmBtn.onclick = () => {
+        this.engine.executeSync();
+      };
+      const cancelBtn = buttonDiv.createEl("button", { text: "Cancel" });
+      cancelBtn.onclick = () => {
+        this.engine.cancelSync();
+        this.close();
+      };
+    }
     if (p.status === "Syncing" || p.status === "Idle") {
-      const upDiv = this.contentContainer.createDiv({ cls: "sync-stat-row" });
-      upDiv.style.marginTop = "10px";
-      upDiv.createEl("strong", { text: "Uploads: " });
-      upDiv.createSpan({ text: `${p.completedUploads} / ${p.totalUploads}` });
-      if (p.totalUploads > 0) {
-        const upProgress = upDiv.createEl("progress");
-        upProgress.max = p.totalUploads;
-        upProgress.value = p.completedUploads;
-        upProgress.style.marginLeft = "10px";
-        upProgress.style.width = "100%";
-      }
-      const downDiv = this.contentContainer.createDiv({ cls: "sync-stat-row" });
-      downDiv.style.marginTop = "10px";
-      downDiv.createEl("strong", { text: "Downloads: " });
-      downDiv.createSpan({ text: `${p.completedDownloads} / ${p.totalDownloads}` });
-      if (p.totalDownloads > 0) {
-        const downProgress = downDiv.createEl("progress");
-        downProgress.max = p.totalDownloads;
-        downProgress.value = p.completedDownloads;
-        downProgress.style.marginLeft = "10px";
-        downProgress.style.width = "100%";
-      }
-      const delDiv = this.contentContainer.createDiv({ cls: "sync-stat-row" });
-      delDiv.style.marginTop = "10px";
-      delDiv.createEl("strong", { text: "Deletions: " });
-      delDiv.createSpan({ text: `${p.completedDeletions} / ${p.totalDeletions}` });
+      const createBar = (label, completed, total) => {
+        const row = this.contentContainer.createDiv({ cls: "sync-stat-row" });
+        row.style.marginTop = "10px";
+        row.createEl("strong", { text: `${label}: ` });
+        row.createSpan({ text: `${completed} / ${total}` });
+        if (total > 0) {
+          const prog = row.createEl("progress");
+          prog.max = total;
+          prog.value = completed;
+          prog.style.marginLeft = "10px";
+          prog.style.width = "100%";
+        }
+      };
+      createBar("Uploads", p.completedUploads, p.totalUploads);
+      createBar("Downloads", p.completedDownloads, p.totalDownloads);
+      createBar("Deletions", p.completedDeletions, p.totalDeletions);
       if (p.status === "Syncing" && p.currentFile) {
         const fileDiv = this.contentContainer.createDiv();
         fileDiv.style.marginTop = "20px";

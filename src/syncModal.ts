@@ -1,4 +1,4 @@
-import { App, Modal } from 'obsidian';
+import { App, Modal, Setting } from 'obsidian';
 import type { SyncEngine } from './syncEngine';
 
 export class SyncStatusModal extends Modal {
@@ -19,7 +19,6 @@ export class SyncStatusModal extends Modal {
 		this.contentContainer = contentEl.createDiv();
 		this.renderData();
 
-		// Register the modal with the engine so it can trigger re-renders
 		this.engine.activeModal = this;
 	}
 
@@ -34,6 +33,7 @@ export class SyncStatusModal extends Modal {
 		this.contentContainer.empty();
 
 		const p = this.engine.progress;
+		const plan = this.engine.pendingPlan;
 
 		const statusEl = this.contentContainer.createEl('h3', { 
 			text: `Status: ${p.status}` 
@@ -48,42 +48,165 @@ export class SyncStatusModal extends Modal {
 			this.contentContainer.createEl('p', { text: 'Scanning local vault and Google Drive metadata...' });
 		}
 
+		if (p.status === 'Confirming' && plan) {
+			this.contentContainer.createEl('p', { text: 'Please review the planned changes before syncing:' });
+
+			const listChanges = (title: string, items: string[], color: string, tooltip?: string) => {
+				if (items.length > 0) {
+					const header = this.contentContainer.createEl('h4', { text: `${title} (${items.length})` });
+					header.style.color = color;
+					if (tooltip) header.title = tooltip;
+					
+					const ul = this.contentContainer.createEl('ul');
+					ul.style.maxHeight = '150px';
+					ul.style.overflowY = 'auto';
+					items.forEach(item => ul.createEl('li', { text: item }));
+				}
+			};
+
+			if (plan.conflicts.length > 0) {
+				const conflictWarning = this.contentContainer.createEl('p', {
+					text: '⚠️ CONFLICTS DETECTED: Files modified on both sides. Please choose a resolution:'
+				});
+				conflictWarning.style.color = 'var(--text-error)';
+				conflictWarning.style.fontWeight = 'bold';
+
+				// 1. GLOBAL BULK BUTTONS
+				const globalBulkDiv = this.contentContainer.createDiv();
+				globalBulkDiv.style.display = 'flex';
+				globalBulkDiv.style.gap = '10px';
+				globalBulkDiv.style.marginBottom = '15px';
+
+				const globalLocalBtn = globalBulkDiv.createEl('button', { text: 'Use Local for All' });
+				globalLocalBtn.onclick = () => {
+					plan.uploads.push(...plan.conflicts);
+					plan.conflicts = [];
+					this.renderData();
+				};
+
+				const globalDriveBtn = globalBulkDiv.createEl('button', { text: 'Use Drive for All' });
+				globalDriveBtn.onclick = () => {
+					plan.downloads.push(...plan.conflicts);
+					plan.conflicts = [];
+					this.renderData();
+				};
+
+				// 2. GROUP BY FOLDER
+				const conflictsByFolder = new Map<string, string[]>();
+				plan.conflicts.forEach(item => {
+					const dir = item.includes('/') ? item.substring(0, item.lastIndexOf('/')) : 'Root';
+					if (!conflictsByFolder.has(dir)) conflictsByFolder.set(dir, []);
+					conflictsByFolder.get(dir)!.push(item);
+				});
+
+				const scrollContainer = this.contentContainer.createDiv();
+				scrollContainer.style.maxHeight = '250px';
+				scrollContainer.style.overflowY = 'auto';
+				scrollContainer.style.border = '1px solid var(--background-modifier-border)';
+				scrollContainer.style.padding = '10px';
+
+				// 3. FOLDER BULK BUTTONS & INDIVIDUAL FILES
+				conflictsByFolder.forEach((files, dir) => {
+					const dirHeader = scrollContainer.createDiv();
+					dirHeader.style.display = 'flex';
+					dirHeader.style.justifyContent = 'space-between';
+					dirHeader.style.alignItems = 'center';
+					dirHeader.style.marginTop = '10px';
+					dirHeader.style.borderBottom = '1px solid var(--background-modifier-border)';
+					
+					dirHeader.createEl('strong', { text: `📂 ${dir}` });
+
+					const dirBulkDiv = dirHeader.createDiv();
+					dirBulkDiv.style.display = 'flex';
+					dirBulkDiv.style.gap = '5px';
+
+					const dirLocalBtn = dirBulkDiv.createEl('button', { text: 'Local (Folder)' });
+					dirLocalBtn.onclick = () => {
+						plan.uploads.push(...files);
+						plan.conflicts = plan.conflicts.filter(c => !files.includes(c));
+						this.renderData();
+					};
+
+					const dirDriveBtn = dirBulkDiv.createEl('button', { text: 'Drive (Folder)' });
+					dirDriveBtn.onclick = () => {
+						plan.downloads.push(...files);
+						plan.conflicts = plan.conflicts.filter(c => !files.includes(c));
+						this.renderData();
+					};
+
+					const ul = scrollContainer.createEl('ul');
+					ul.style.marginBottom = '15px';
+
+					files.forEach(item => {
+						const li = ul.createEl('li');
+						li.style.display = 'flex';
+						li.style.justifyContent = 'space-between';
+						li.style.alignItems = 'center';
+						li.style.marginBottom = '8px';
+						
+						li.createSpan({ text: item.includes('/') ? item.substring(item.lastIndexOf('/') + 1) : item });
+
+						const btnDiv = li.createDiv();
+						btnDiv.style.display = 'flex';
+						btnDiv.style.gap = '5px';
+
+						const useLocalBtn = btnDiv.createEl('button', { text: 'Local' });
+						useLocalBtn.onclick = () => {
+							plan.uploads.push(item);
+							plan.conflicts = plan.conflicts.filter(c => c !== item);
+							this.renderData();
+						};
+
+						const useDriveBtn = btnDiv.createEl('button', { text: 'Drive' });
+						useDriveBtn.onclick = () => {
+							plan.downloads.push(item);
+							plan.conflicts = plan.conflicts.filter(c => c !== item);
+							this.renderData();
+						};
+					});
+				});
+			}
+			listChanges('Uploads', plan.uploads, 'var(--text-success)');
+			listChanges('Downloads', plan.downloads, 'var(--text-accent)');
+			listChanges('Local Deletions', plan.deletionsLocal, 'var(--text-muted)');
+			listChanges('Remote Deletions', plan.deletionsRemote, 'var(--text-muted)');
+
+			const buttonDiv = this.contentContainer.createDiv();
+			buttonDiv.style.marginTop = '20px';
+			buttonDiv.style.display = 'flex';
+			buttonDiv.style.gap = '10px';
+
+			const confirmBtn = buttonDiv.createEl('button', { text: 'Confirm Sync', cls: 'mod-cta' });
+			confirmBtn.onclick = () => {
+				this.engine.executeSync();
+			};
+
+			const cancelBtn = buttonDiv.createEl('button', { text: 'Cancel' });
+			cancelBtn.onclick = () => {
+				this.engine.cancelSync();
+				this.close();
+			};
+		}
+
 		if (p.status === 'Syncing' || p.status === 'Idle') {
-			// Uploads
-			const upDiv = this.contentContainer.createDiv({ cls: 'sync-stat-row' });
-			upDiv.style.marginTop = '10px';
-			upDiv.createEl('strong', { text: 'Uploads: ' });
-			upDiv.createSpan({ text: `${p.completedUploads} / ${p.totalUploads}` });
-			
-			if (p.totalUploads > 0) {
-				const upProgress = upDiv.createEl('progress');
-				upProgress.max = p.totalUploads;
-				upProgress.value = p.completedUploads;
-				upProgress.style.marginLeft = '10px';
-				upProgress.style.width = '100%';
-			}
+			const createBar = (label: string, completed: number, total: number) => {
+				const row = this.contentContainer.createDiv({ cls: 'sync-stat-row' });
+				row.style.marginTop = '10px';
+				row.createEl('strong', { text: `${label}: ` });
+				row.createSpan({ text: `${completed} / ${total}` });
+				if (total > 0) {
+					const prog = row.createEl('progress');
+					prog.max = total;
+					prog.value = completed;
+					prog.style.marginLeft = '10px';
+					prog.style.width = '100%';
+				}
+			};
 
-			// Downloads
-			const downDiv = this.contentContainer.createDiv({ cls: 'sync-stat-row' });
-			downDiv.style.marginTop = '10px';
-			downDiv.createEl('strong', { text: 'Downloads: ' });
-			downDiv.createSpan({ text: `${p.completedDownloads} / ${p.totalDownloads}` });
-			
-			if (p.totalDownloads > 0) {
-				const downProgress = downDiv.createEl('progress');
-				downProgress.max = p.totalDownloads;
-				downProgress.value = p.completedDownloads;
-				downProgress.style.marginLeft = '10px';
-				downProgress.style.width = '100%';
-			}
+			createBar('Uploads', p.completedUploads, p.totalUploads);
+			createBar('Downloads', p.completedDownloads, p.totalDownloads);
+			createBar('Deletions', p.completedDeletions, p.totalDeletions);
 
-			// Deletions
-			const delDiv = this.contentContainer.createDiv({ cls: 'sync-stat-row' });
-			delDiv.style.marginTop = '10px';
-			delDiv.createEl('strong', { text: 'Deletions: ' });
-			delDiv.createSpan({ text: `${p.completedDeletions} / ${p.totalDeletions}` });
-
-			// Current File
 			if (p.status === 'Syncing' && p.currentFile) {
 				const fileDiv = this.contentContainer.createDiv();
 				fileDiv.style.marginTop = '20px';
