@@ -177,7 +177,7 @@ var GoogleDriveApi = class {
         requestBody = JSON.stringify(body);
       }
     }
-    await new Promise((resolve) => window.setTimeout(resolve, 150));
+    await new Promise((resolve) => window.setTimeout(resolve, 50));
     let attempt = 0;
     while (attempt <= retries) {
       attempt++;
@@ -633,6 +633,16 @@ ${logContent}`);
     this.updateProgressUI();
     new import_obsidian4.Notice("Sync Cancelled.");
   }
+  async processConcurrently(items, concurrency, processor) {
+    const queue = [...items];
+    const workers = Array(concurrency).fill(null).map(async () => {
+      while (queue.length > 0) {
+        const item = queue.shift();
+        await processor(item);
+      }
+    });
+    await Promise.all(workers);
+  }
   async executeSync() {
     if (!this.pendingPlan)
       return;
@@ -649,7 +659,47 @@ ${logContent}`);
       for (const path of Object.keys(plan.state.files)) {
         newState.files[path] = plan.state.files[path];
       }
-      for (const path of plan.deletionsLocal) {
+      const uniqueDriveDirs = /* @__PURE__ */ new Set();
+      plan.uploads.forEach((p) => {
+        const d = p.includes("/") ? p.substring(0, p.lastIndexOf("/")) : "";
+        if (d)
+          uniqueDriveDirs.add(d);
+      });
+      plan.conflicts.forEach((p) => {
+        const d = p.includes("/") ? p.substring(0, p.lastIndexOf("/")) : "";
+        if (d)
+          uniqueDriveDirs.add(d);
+      });
+      for (const dir of uniqueDriveDirs) {
+        await this.plugin.driveApi.getOrCreateFolderTree(dir, plan.rootFolderId);
+      }
+      const uniqueLocalDirs = /* @__PURE__ */ new Set();
+      plan.downloads.forEach((p) => {
+        const d = p.includes("/") ? p.substring(0, p.lastIndexOf("/")) : "";
+        if (d)
+          uniqueLocalDirs.add(d);
+      });
+      plan.conflicts.forEach((p) => {
+        const d = p.includes("/") ? p.substring(0, p.lastIndexOf("/")) : "";
+        if (d)
+          uniqueLocalDirs.add(d);
+      });
+      for (const dir of uniqueLocalDirs) {
+        if (!dir)
+          continue;
+        const parts = dir.split("/");
+        let current = "";
+        for (const part of parts) {
+          current += (current === "" ? "" : "/") + part;
+          if (!await this.plugin.app.vault.adapter.exists(current)) {
+            try {
+              await this.plugin.app.vault.adapter.mkdir(current);
+            } catch (e) {
+            }
+          }
+        }
+      }
+      await this.processConcurrently(plan.deletionsLocal, 5, async (path) => {
         this.progress.currentFile = path;
         this.updateProgressUI();
         if (await this.plugin.app.vault.adapter.exists(path)) {
@@ -658,8 +708,8 @@ ${logContent}`);
         delete newState.files[path];
         deletedFiles.push(path);
         this.progress.completedDeletions++;
-      }
-      for (const path of plan.conflicts) {
+      });
+      await this.processConcurrently(plan.conflicts, 5, async (path) => {
         this.progress.currentFile = `[CONFLICT] ${path}`;
         this.updateProgressUI();
         const lFile = plan.localFiles.get(path);
@@ -678,8 +728,8 @@ ${logContent}`);
         newState.files[path] = { local: lFile.stat.mtime, drive: dFileRes.modifiedTime };
         conflictFiles.push(path);
         this.progress.completedUploads++;
-      }
-      for (const path of plan.uploads) {
+      });
+      await this.processConcurrently(plan.uploads, 5, async (path) => {
         this.progress.currentFile = path;
         this.updateProgressUI();
         const lFile = plan.localFiles.get(path);
@@ -692,8 +742,8 @@ ${logContent}`);
         newState.files[path] = { local: lFile.stat.mtime, drive: dFileRes.modifiedTime };
         uploadedFiles.push(path);
         this.progress.completedUploads++;
-      }
-      for (const path of plan.deletionsRemote) {
+      });
+      await this.processConcurrently(plan.deletionsRemote, 5, async (path) => {
         this.progress.currentFile = path;
         this.updateProgressUI();
         const dFile = plan.driveFiles.get(path);
@@ -703,27 +753,18 @@ ${logContent}`);
         delete newState.files[path];
         deletedFiles.push(path);
         this.progress.completedDeletions++;
-      }
-      for (const path of plan.downloads) {
+      });
+      await this.processConcurrently(plan.downloads, 5, async (path) => {
         this.progress.currentFile = path;
         this.updateProgressUI();
         const dFile = plan.driveFiles.get(path);
         const content = await this.plugin.driveApi.downloadFile(dFile.id);
-        const parts = path.split("/");
-        parts.pop();
-        let currentPath = "";
-        for (const part of parts) {
-          currentPath += (currentPath === "" ? "" : "/") + part;
-          if (!await this.plugin.app.vault.adapter.exists(currentPath)) {
-            await this.plugin.app.vault.adapter.mkdir(currentPath);
-          }
-        }
         await this.plugin.app.vault.adapter.writeBinary(path, content);
         const newStat = await this.plugin.app.vault.adapter.stat(path);
         newState.files[path] = { local: newStat.mtime, drive: dFile.modifiedTime };
         downloadedFiles.push(path);
         this.progress.completedDownloads++;
-      }
+      });
       for (const path of plan.localFiles.keys()) {
         if (!plan.uploads.includes(path) && !plan.deletionsLocal.includes(path) && !plan.downloads.includes(path) && !plan.conflicts.includes(path)) {
           const lFile = plan.localFiles.get(path);

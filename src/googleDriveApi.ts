@@ -34,12 +34,6 @@ export class GoogleDriveApi {
 			} else {
 				headers['Content-Type'] = 'application/json';
 				requestBody = JSON.stringify(body);
-			}
-		}
-
-		// Global throttle to prevent bursting the API
-		await new Promise(resolve => window.setTimeout(resolve, 150));
-
 		let attempt = 0;
 		while (attempt <= retries) {
 			attempt++;
@@ -54,7 +48,8 @@ export class GoogleDriveApi {
 				});
 			} catch (networkError) {
 				if (attempt <= retries) {
-					const backoffTime = attempt * 2000;
+					const jitter = Math.floor(Math.random() * 1000);
+					const backoffTime = (attempt * 2000) + jitter;
 					console.log(`Drive API Network Error (${networkError.message}). Retrying in ${backoffTime}ms...`);
 					await new Promise(resolve => window.setTimeout(resolve, backoffTime));
 					continue;
@@ -71,7 +66,8 @@ export class GoogleDriveApi {
 
 			// If it's a rate limit error (403 or 429) and we have retries left, back off
 			if ((response.status === 403 || response.status === 429 || response.status >= 500) && attempt <= retries) {
-				const backoffTime = attempt * 2000; // 2s, 4s, 6s
+				const jitter = Math.floor(Math.random() * 1000);
+				const backoffTime = (attempt * 2000) + jitter;
 				console.log(`Drive API rate limited/server error (${response.status}). Retrying in ${backoffTime}ms...`);
 				await new Promise(resolve => window.setTimeout(resolve, backoffTime));
 				continue;

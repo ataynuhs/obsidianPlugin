@@ -346,6 +346,17 @@ export class SyncEngine {
 		new Notice('Sync Cancelled.');
 	}
 
+	private async processConcurrently<T>(items: T[], concurrency: number, processor: (item: T) => Promise<void>) {
+		const queue = [...items];
+		const workers = Array(concurrency).fill(null).map(async () => {
+			while (queue.length > 0) {
+				const item = queue.shift()!;
+				await processor(item);
+			}
+		});
+		await Promise.all(workers);
+	}
+
 	public async executeSync() {
 		if (!this.pendingPlan) return;
 		
@@ -367,8 +378,32 @@ export class SyncEngine {
 				newState.files[path] = plan.state.files[path];
 			}
 
+			// 1.5 Folder Pre-flight: Pre-create Drive Folders sequentially to prevent race condition duplicates
+			const uniqueDriveDirs = new Set<string>();
+			plan.uploads.forEach(p => { const d = p.includes('/') ? p.substring(0, p.lastIndexOf('/')) : ''; if (d) uniqueDriveDirs.add(d); });
+			plan.conflicts.forEach(p => { const d = p.includes('/') ? p.substring(0, p.lastIndexOf('/')) : ''; if (d) uniqueDriveDirs.add(d); });
+			for (const dir of uniqueDriveDirs) {
+				await this.plugin.driveApi.getOrCreateFolderTree(dir, plan.rootFolderId);
+			}
+
+			// 1.6 Pre-create Local Folders sequentially to prevent mkdir race conditions
+			const uniqueLocalDirs = new Set<string>();
+			plan.downloads.forEach(p => { const d = p.includes('/') ? p.substring(0, p.lastIndexOf('/')) : ''; if (d) uniqueLocalDirs.add(d); });
+			plan.conflicts.forEach(p => { const d = p.includes('/') ? p.substring(0, p.lastIndexOf('/')) : ''; if (d) uniqueLocalDirs.add(d); });
+			for (const dir of uniqueLocalDirs) {
+				if (!dir) continue;
+				const parts = dir.split('/');
+				let current = '';
+				for (const part of parts) {
+					current += (current === '' ? '' : '/') + part;
+					if (!(await this.plugin.app.vault.adapter.exists(current))) {
+						try { await this.plugin.app.vault.adapter.mkdir(current); } catch(e) {}
+					}
+				}
+			}
+
 			// 1. Local Deletions
-			for (const path of plan.deletionsLocal) {
+			await this.processConcurrently(plan.deletionsLocal, 12, async (path) => {
 				this.progress.currentFile = path; this.updateProgressUI();
 				if (await this.plugin.app.vault.adapter.exists(path)) {
 					await this.plugin.app.vault.adapter.remove(path);
@@ -376,10 +411,10 @@ export class SyncEngine {
 				delete newState.files[path];
 				deletedFiles.push(path);
 				this.progress.completedDeletions++;
-			}
+			});
 
 			// 2. Conflicts
-			for (const path of plan.conflicts) {
+			await this.processConcurrently(plan.conflicts, 12, async (path) => {
 				this.progress.currentFile = `[CONFLICT] ${path}`; this.updateProgressUI();
 				const lFile = plan.localFiles.get(path)!;
 				const dFile = plan.driveFiles.get(path)!;
@@ -404,10 +439,10 @@ export class SyncEngine {
 				
 				conflictFiles.push(path);
 				this.progress.completedUploads++;
-			}
+			});
 
 			// 3. Uploads
-			for (const path of plan.uploads) {
+			await this.processConcurrently(plan.uploads, 12, async (path) => {
 				this.progress.currentFile = path; this.updateProgressUI();
 				const lFile = plan.localFiles.get(path)!;
 				const dFile = plan.driveFiles.get(path);
@@ -420,10 +455,10 @@ export class SyncEngine {
 				newState.files[path] = { local: lFile.stat.mtime, drive: dFileRes.modifiedTime };
 				uploadedFiles.push(path);
 				this.progress.completedUploads++;
-			}
+			});
 
 			// 4. Remote Deletions
-			for (const path of plan.deletionsRemote) {
+			await this.processConcurrently(plan.deletionsRemote, 12, async (path) => {
 				this.progress.currentFile = path; this.updateProgressUI();
 				const dFile = plan.driveFiles.get(path);
 				if (dFile) {
@@ -432,30 +467,20 @@ export class SyncEngine {
 				delete newState.files[path];
 				deletedFiles.push(path);
 				this.progress.completedDeletions++;
-			}
+			});
 
 			// 5. Downloads
-			for (const path of plan.downloads) {
+			await this.processConcurrently(plan.downloads, 12, async (path) => {
 				this.progress.currentFile = path; this.updateProgressUI();
 				const dFile = plan.driveFiles.get(path)!;
 				const content = await this.plugin.driveApi.downloadFile(dFile.id);
 				
-				const parts = path.split('/');
-				parts.pop();
-				let currentPath = '';
-				for (const part of parts) {
-					currentPath += (currentPath === '' ? '' : '/') + part;
-					if (!(await this.plugin.app.vault.adapter.exists(currentPath))) {
-						await this.plugin.app.vault.adapter.mkdir(currentPath);
-					}
-				}
-
 				await this.plugin.app.vault.adapter.writeBinary(path, content);
 				const newStat = await this.plugin.app.vault.adapter.stat(path);
 				newState.files[path] = { local: newStat!.mtime, drive: dFile.modifiedTime };
 				downloadedFiles.push(path);
 				this.progress.completedDownloads++;
-			}
+			});
 
 			// 6. Unchanged Files
 			for (const path of plan.localFiles.keys()) {
