@@ -264,10 +264,10 @@ export class SyncEngine {
 						}
 					}
 					
-					const isConflict = stateFile && localChanged && remoteChanged;
+					const isConflict = stateFile && typeof stateFile !== 'string' && localChanged && remoteChanged;
 
-					if (!stateFile) {
-						// EMERGENCY FALLBACK: No state (first sync or reset). Use Last Write Wins.
+					if (!stateFile || typeof stateFile === 'string') {
+						// EMERGENCY FALLBACK & LEGACY MIGRATION: No reliable local state history. Use Last Write Wins.
 						if (lTime > dTime + 2000) {
 							plan.uploads.push(path);
 						} else if (dTime > lTime + 2000) {

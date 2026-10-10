@@ -567,8 +567,8 @@ ${logContent}`);
               remoteChanged = Math.abs(dTime - stateDriveTime) > 2e3;
             }
           }
-          const isConflict = stateFile && localChanged && remoteChanged;
-          if (!stateFile) {
+          const isConflict = stateFile && typeof stateFile !== "string" && localChanged && remoteChanged;
+          if (!stateFile || typeof stateFile === "string") {
             if (lTime > dTime + 2e3) {
               plan.uploads.push(path);
             } else if (dTime > lTime + 2e3) {
