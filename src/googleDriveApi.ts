@@ -34,6 +34,9 @@ export class GoogleDriveApi {
 			} else {
 				headers['Content-Type'] = 'application/json';
 				requestBody = JSON.stringify(body);
+			}
+		}
+
 		let attempt = 0;
 		while (attempt <= retries) {
 			attempt++;

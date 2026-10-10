@@ -177,7 +177,6 @@ var GoogleDriveApi = class {
         requestBody = JSON.stringify(body);
       }
     }
-    await new Promise((resolve) => window.setTimeout(resolve, 50));
     let attempt = 0;
     while (attempt <= retries) {
       attempt++;
@@ -192,7 +191,8 @@ var GoogleDriveApi = class {
         });
       } catch (networkError) {
         if (attempt <= retries) {
-          const backoffTime = attempt * 2e3;
+          const jitter = Math.floor(Math.random() * 1e3);
+          const backoffTime = attempt * 2e3 + jitter;
           console.log(`Drive API Network Error (${networkError.message}). Retrying in ${backoffTime}ms...`);
           await new Promise((resolve) => window.setTimeout(resolve, backoffTime));
           continue;
@@ -206,7 +206,8 @@ var GoogleDriveApi = class {
         return response.text ? response.json : null;
       }
       if ((response.status === 403 || response.status === 429 || response.status >= 500) && attempt <= retries) {
-        const backoffTime = attempt * 2e3;
+        const jitter = Math.floor(Math.random() * 1e3);
+        const backoffTime = attempt * 2e3 + jitter;
         console.log(`Drive API rate limited/server error (${response.status}). Retrying in ${backoffTime}ms...`);
         await new Promise((resolve) => window.setTimeout(resolve, backoffTime));
         continue;
@@ -699,7 +700,7 @@ ${logContent}`);
           }
         }
       }
-      await this.processConcurrently(plan.deletionsLocal, 5, async (path) => {
+      await this.processConcurrently(plan.deletionsLocal, 12, async (path) => {
         this.progress.currentFile = path;
         this.updateProgressUI();
         if (await this.plugin.app.vault.adapter.exists(path)) {
@@ -709,7 +710,7 @@ ${logContent}`);
         deletedFiles.push(path);
         this.progress.completedDeletions++;
       });
-      await this.processConcurrently(plan.conflicts, 5, async (path) => {
+      await this.processConcurrently(plan.conflicts, 12, async (path) => {
         this.progress.currentFile = `[CONFLICT] ${path}`;
         this.updateProgressUI();
         const lFile = plan.localFiles.get(path);
@@ -729,7 +730,7 @@ ${logContent}`);
         conflictFiles.push(path);
         this.progress.completedUploads++;
       });
-      await this.processConcurrently(plan.uploads, 5, async (path) => {
+      await this.processConcurrently(plan.uploads, 12, async (path) => {
         this.progress.currentFile = path;
         this.updateProgressUI();
         const lFile = plan.localFiles.get(path);
@@ -743,7 +744,7 @@ ${logContent}`);
         uploadedFiles.push(path);
         this.progress.completedUploads++;
       });
-      await this.processConcurrently(plan.deletionsRemote, 5, async (path) => {
+      await this.processConcurrently(plan.deletionsRemote, 12, async (path) => {
         this.progress.currentFile = path;
         this.updateProgressUI();
         const dFile = plan.driveFiles.get(path);
@@ -754,7 +755,7 @@ ${logContent}`);
         deletedFiles.push(path);
         this.progress.completedDeletions++;
       });
-      await this.processConcurrently(plan.downloads, 5, async (path) => {
+      await this.processConcurrently(plan.downloads, 12, async (path) => {
         this.progress.currentFile = path;
         this.updateProgressUI();
         const dFile = plan.driveFiles.get(path);
