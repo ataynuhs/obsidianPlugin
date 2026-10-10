@@ -10,7 +10,7 @@ export default {
 
     // Endpoint 1: Initiate Login
     if (url.pathname === "/login") {
-      const vault = url.searchParams.get("vault") || "";
+      const vault = url.searchParams.get("vault") || "ObsidianSync";
       const redirectUri = `${url.origin}/callback`;
       const scope = encodeURIComponent("https://www.googleapis.com/auth/drive.file");
       
